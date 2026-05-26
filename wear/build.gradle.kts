@@ -40,6 +40,9 @@ android {
 }
 
 dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.8.1")
+    implementation("androidx.health:health-services-client:1.1.0-rc02")
+    implementation("androidx.concurrent:concurrent-futures-ktx:1.2.0")
     implementation("com.google.android.gms:play-services-wearable:20.0.1")
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
