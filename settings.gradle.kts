@@ -24,3 +24,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "BikeHeartRateApp"
 include(":app")
+include(":wear")
