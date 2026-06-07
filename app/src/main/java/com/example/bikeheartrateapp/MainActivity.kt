@@ -65,6 +65,7 @@ import org.eclipse.paho.client.mqttv3.MqttCallback
 import org.eclipse.paho.client.mqttv3.MqttClient
 import org.eclipse.paho.client.mqttv3.MqttMessage
 import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
+import org.json.JSONArray
 import org.json.JSONObject
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
@@ -78,19 +79,32 @@ private const val DEFAULT_HEART_RATE_TOPIC = "anthony/bike_001/heart_rate"
 private const val DEFAULT_SESSION_TOPIC = "anthony/bike_001/session"
 private const val DEFAULT_COMMAND_TOPIC = "anthony/bike_001/commands"
 private const val DEFAULT_TELEMETRY_TOPIC = "anthony/bike_001/merged_sensors"
+private const val ATHLETES_FILE_NAME = "athletes.json"
 private const val WAITING_TEXT = "Waiting\u2026"
 private const val COACHING_WAITING_TEXT = "Waiting for coaching feedback\u2026"
 
 private val DASHBOARD_TIME_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
+private val SESSION_ID_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyyMMddHHmmss")
 
-private val VALID_WORKOUT_TYPES = setOf("speed", "cadence", "endurance", "vo2_max")
+private val WORKOUT_TYPE_OPTIONS = listOf("endurance", "interval", "recovery", "vo2_max", "free_ride")
+private val VALID_WORKOUT_TYPES = WORKOUT_TYPE_OPTIONS.toSet()
 
 private enum class AppPage(val label: String) {
     Settings("Settings"),
-    Athlete("Athlete"),
-    HrTest("HR Test"),
+    Athletes("Athletes"),
+    Workout("Workout"),
     Dashboard("Dashboard")
 }
+
+private data class AthleteProfile(
+    val profileId: String,
+    val name: String,
+    val age: Int,
+    val weight: Double,
+    val height: Double,
+    val email: String,
+    val fitnessLevel: String
+)
 
 private data class TelemetryValues(
     val deviceId: String = "--",
@@ -141,19 +155,24 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
     private val athleteWeightKg = mutableStateOf("")
     private val athleteHeightCm = mutableStateOf("")
     private val athleteEmail = mutableStateOf("")
+    private val athleteFitnessLevel = mutableStateOf("")
     private val selectedWorkoutType = mutableStateOf("endurance")
+    private val athletes = mutableStateOf<List<AthleteProfile>>(emptyList())
+    private val selectedAthleteProfileId = mutableStateOf("")
+    private val activeAthlete = mutableStateOf<AthleteProfile?>(null)
+    private val activeWorkoutType = mutableStateOf("")
+    private val activeSessionId = mutableStateOf("")
 
     private val sessionId = mutableStateOf("Waiting for session...")
     private val syncedWorkoutType = mutableStateOf("--")
     private val sessionStatus = mutableStateOf("No active session")
 
-    private val manualHeartRate = mutableStateOf("132")
-    private val manualHrSessionId = mutableStateOf("")
+    private val latestHeartRateBpm = mutableStateOf("132")
 
     private val telemetry = mutableStateOf(TelemetryValues())
     private val settingsStatus = mutableStateOf("Ready")
     private val athleteStatus = mutableStateOf("Ready")
-    private val hrTestStatus = mutableStateOf("Ready")
+    private val heartRateStatus = mutableStateOf("Ready")
     private val dashboardStatus = mutableStateOf("Ready")
     private val telemetryStatus = mutableStateOf("Waiting for telemetry...")
 
@@ -166,7 +185,17 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        val storedAthletes = loadAthletesFromJson()
+        athletes.value = storedAthletes
+        if (storedAthletes.size == 1) {
+            selectedAthleteProfileId.value = storedAthletes.first().profileId
+        }
+
         setContent {
+            val selectedAthlete = athletes.value.firstOrNull {
+                it.profileId == selectedAthleteProfileId.value
+            }
+
             BikeHeartRateAppTheme {
                 BikeTrainerApp(
                     currentPage = currentPage.value,
@@ -201,21 +230,25 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
                     onAthleteHeightCmChange = { athleteHeightCm.value = it },
                     athleteEmail = athleteEmail.value,
                     onAthleteEmailChange = { athleteEmail.value = it },
+                    athleteFitnessLevel = athleteFitnessLevel.value,
+                    onAthleteFitnessLevelChange = { athleteFitnessLevel.value = it },
+                    athletes = athletes.value,
+                    onDeleteAthleteClick = { deleteAthlete(it) },
+                    selectedAthleteProfileId = selectedAthleteProfileId.value,
+                    onSelectedAthleteChange = { selectedAthleteProfileId.value = it },
+                    selectedAthlete = selectedAthlete,
+                    activeAthlete = activeAthlete.value,
+                    activeWorkoutType = activeWorkoutType.value,
+                    activeSessionId = activeSessionId.value,
                     selectedWorkoutType = selectedWorkoutType.value,
                     onWorkoutTypeChange = { selectedWorkoutType.value = it },
                     athleteStatus = athleteStatus.value,
-                    onSaveAthleteClick = { saveAthlete() },
-                    manualHeartRate = manualHeartRate.value,
-                    onManualHeartRateChange = { manualHeartRate.value = it },
-                    manualHrSessionId = manualHrSessionId.value,
-                    onManualHrSessionIdChange = { manualHrSessionId.value = it },
-                    hrTestStatus = hrTestStatus.value,
-                    onPublishTestHrClick = { publishManualHeartRate() },
+                    onSaveAthleteClick = { addAthlete() },
                     telemetry = telemetry.value,
                     telemetryStatus = telemetryStatus.value,
                     dashboardStatus = dashboardStatus.value,
-                    onStartWorkoutClick = { sendStartWorkoutCommand() },
-                    onStopWorkoutClick = { sendStopWorkoutCommand() }
+                    onStartWorkoutClick = { publishStartWorkout() },
+                    onStopWorkoutClick = { publishEndWorkout() }
                 )
             }
         }
@@ -246,12 +279,12 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
 
         mainScope.launch {
             if (bpm == null || bpm <= 0) {
-                hrTestStatus.value = "Invalid BPM from watch: $bpmText"
+                heartRateStatus.value = "Invalid BPM from watch: $bpmText"
                 return@launch
             }
 
-            manualHeartRate.value = bpm.toString()
-            hrTestStatus.value = "Received BPM $bpm from watch. Publishing..."
+            latestHeartRateBpm.value = bpm.toString()
+            heartRateStatus.value = "Received BPM $bpm from watch. Publishing..."
             publishCurrentHeartRate("samsung_watch_5_pro")
         }
     }
@@ -268,28 +301,97 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
         startMqttSubscriptions(forceReconnect = true)
     }
 
-    private fun saveAthlete() {
-        athleteStatus.value = validateAthleteInput() ?: "Athlete saved"
-    }
+    private fun addAthlete() {
+        val validationError = validateAthleteInput()
 
-    private fun sendStartWorkoutCommand() {
-        val portValue = port.value.trim().toIntOrNull()
-        val validationError = validateSettings(requireCommandTopic = true)
-            ?: validateAthleteInput()
-
-        if (validationError != null || portValue == null) {
-            dashboardStatus.value = validationError ?: "Invalid port"
+        if (validationError != null) {
+            athleteStatus.value = validationError
             return
         }
 
-        val payload = buildStartWorkoutPayload(
-            deviceId = deviceId.value.trim(),
-            workoutType = selectedWorkoutType.value.trim(),
+        val profile = AthleteProfile(
+            profileId = nextProfileId(),
             name = athleteName.value.trim(),
             age = athleteAge.value.trim().toInt(),
-            weightKg = athleteWeightKg.value.trim().toDouble(),
-            heightCm = athleteHeightCm.value.trim().toDouble(),
-            email = athleteEmail.value.trim()
+            weight = athleteWeightKg.value.trim().toDouble(),
+            height = athleteHeightCm.value.trim().toDouble(),
+            email = athleteEmail.value.trim(),
+            fitnessLevel = athleteFitnessLevel.value.trim()
+        )
+        val nextAthletes = athletes.value + profile
+
+        if (!saveAthletesToJson(nextAthletes)) {
+            athleteStatus.value = "Could not save athlete"
+            return
+        }
+
+        athletes.value = nextAthletes
+        selectedAthleteProfileId.value = profile.profileId
+        athleteName.value = ""
+        athleteAge.value = ""
+        athleteWeightKg.value = ""
+        athleteHeightCm.value = ""
+        athleteEmail.value = ""
+        athleteFitnessLevel.value = ""
+        athleteStatus.value = "Saved ${profile.name}"
+    }
+
+    private fun deleteAthlete(profileId: String) {
+        val profile = athletes.value.firstOrNull { it.profileId == profileId } ?: return
+        val nextAthletes = athletes.value.filterNot { it.profileId == profileId }
+
+        if (!saveAthletesToJson(nextAthletes)) {
+            athleteStatus.value = "Could not delete ${profile.name}"
+            return
+        }
+
+        athletes.value = nextAthletes
+        if (selectedAthleteProfileId.value == profileId) {
+            selectedAthleteProfileId.value = nextAthletes.firstOrNull()?.profileId.orEmpty()
+        }
+        athleteStatus.value = "Deleted ${profile.name}"
+    }
+
+    private fun publishStartWorkout() {
+        val portValue = port.value.trim().toIntOrNull()
+        val settingsError = validateSettings(requireCommandTopic = true)
+        val selectedAthlete = athletes.value.firstOrNull {
+            it.profileId == selectedAthleteProfileId.value
+        }
+        val workoutTypeValue = selectedWorkoutType.value.trim()
+        val sessionAlreadyActive =
+            activeAthlete.value != null ||
+                classifyWorkoutState(sessionStatus.value) == WorkoutDisplayState.Active
+
+        when {
+            settingsError != null -> {
+                dashboardStatus.value = settingsError
+                return
+            }
+            portValue == null -> {
+                dashboardStatus.value = "Invalid port"
+                return
+            }
+            selectedAthlete == null -> {
+                dashboardStatus.value = "Select an athlete before starting"
+                return
+            }
+            workoutTypeValue !in VALID_WORKOUT_TYPES -> {
+                dashboardStatus.value = "Select a valid workout type"
+                return
+            }
+            sessionAlreadyActive -> {
+                dashboardStatus.value = "A workout is already active"
+                return
+            }
+        }
+
+        val sessionValue = resolveStartSessionId()
+        val payload = buildStartWorkoutPayload(
+            deviceId = deviceId.value.trim(),
+            sessionId = sessionValue,
+            athlete = selectedAthlete,
+            workoutType = workoutTypeValue
         ).toString()
 
         dashboardStatus.value = "Sending start command\u2026"
@@ -299,89 +401,208 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
             topic = commandTopic.value.trim(),
             payload = payload
         ) { success, message ->
-            dashboardStatus.value = if (success) {
-                "Start command sent"
+            if (success) {
+                activeAthlete.value = selectedAthlete
+                activeWorkoutType.value = workoutTypeValue
+                activeSessionId.value = sessionValue
+                sessionId.value = sessionValue
+                syncedWorkoutType.value = workoutTypeValue
+                sessionStatus.value = "Active session synced"
+                telemetry.value = telemetry.value.copy(
+                    sessionId = sessionValue,
+                    workoutType = workoutTypeValue,
+                    workoutStatus = "started"
+                )
+                dashboardStatus.value = "Start command sent"
             } else {
-                "Failed to send start command: $message"
+                dashboardStatus.value = "Failed to send start command: $message"
             }
         }
     }
 
-    private fun sendStopWorkoutCommand() {
+    private fun publishEndWorkout() {
         val portValue = port.value.trim().toIntOrNull()
         val validationError = validateSettings(requireCommandTopic = true)
-
-        if (validationError != null || portValue == null) {
-            dashboardStatus.value = validationError ?: "Invalid port"
-            return
+        val athlete = activeAthlete.value
+        val workoutTypeValue = activeWorkoutType.value.ifBlank {
+            selectedWorkoutType.value.trim()
+        }
+        val sessionValue = activeSessionId.value.ifBlank {
+            sessionId.value.trim().takeUnless { it == "Waiting for session..." }.orEmpty()
         }
 
-        val payload = buildStopWorkoutPayload(deviceId.value.trim()).toString()
+        when {
+            validationError != null -> {
+                dashboardStatus.value = validationError
+                return
+            }
+            portValue == null -> {
+                dashboardStatus.value = "Invalid port"
+                return
+            }
+            athlete == null -> {
+                dashboardStatus.value = "No active workout to end"
+                return
+            }
+            sessionValue.isBlank() -> {
+                dashboardStatus.value = "No active session to end"
+                return
+            }
+            workoutTypeValue !in VALID_WORKOUT_TYPES -> {
+                dashboardStatus.value = "No valid active workout type"
+                return
+            }
+        }
 
-        dashboardStatus.value = "Sending stop command\u2026"
+        val payload = buildEndWorkoutPayload(
+            deviceId = deviceId.value.trim(),
+            sessionId = sessionValue,
+            athlete = athlete,
+            workoutType = workoutTypeValue
+        ).toString()
+
+        dashboardStatus.value = "Sending end command\u2026"
         publishMqttJson(
             broker = broker.value.trim(),
             port = portValue,
             topic = commandTopic.value.trim(),
             payload = payload
         ) { success, message ->
-            dashboardStatus.value = if (success) {
-                "Stop command sent"
+            if (success) {
+                sessionStatus.value = "Session stopped"
+                telemetry.value = telemetry.value.copy(
+                    sessionId = sessionValue,
+                    workoutType = workoutTypeValue,
+                    workoutStatus = "ended"
+                )
+                activeAthlete.value = null
+                activeWorkoutType.value = ""
+                activeSessionId.value = ""
+                dashboardStatus.value = "End command sent"
             } else {
-                "Failed to send stop command: $message"
+                dashboardStatus.value = "Failed to send end command: $message"
             }
         }
     }
 
-    private fun publishManualHeartRate() {
-        val brokerValue = broker.value.trim()
-        val portValue = port.value.trim().toIntOrNull()
-        val deviceValue = deviceId.value.trim()
-        val heartRateTopicValue = heartRateTopic.value.trim()
-        val bpmValue = manualHeartRate.value.trim().toIntOrNull()
-        val sessionValue = manualHrSessionId.value.trim().ifBlank {
-            sessionId.value.trim().takeUnless { it == "Waiting for session..." } ?: ""
+    private fun resolveStartSessionId(): String {
+        val currentSessionId = sessionId.value.trim()
+        val hasCurrentActiveSession =
+            currentSessionId.isNotBlank() &&
+                currentSessionId != "Waiting for session..." &&
+                classifyWorkoutState(sessionStatus.value) == WorkoutDisplayState.Active
+
+        return if (hasCurrentActiveSession) {
+            currentSessionId
+        } else {
+            "session_${LocalDateTime.now().format(SESSION_ID_FORMATTER)}"
+        }
+    }
+
+    private fun nextProfileId(): String {
+        val nextNumber = athletes.value
+            .mapNotNull { it.profileId.removePrefix("profile_").toIntOrNull() }
+            .maxOrNull()
+            ?.plus(1)
+            ?: 1
+
+        return "profile_${nextNumber.toString().padStart(3, '0')}"
+    }
+
+    private fun loadAthletesFromJson(): List<AthleteProfile> {
+        val file = getFileStreamPath(ATHLETES_FILE_NAME)
+        if (!file.exists()) return emptyList()
+
+        return try {
+            val text = openFileInput(ATHLETES_FILE_NAME)
+                .bufferedReader()
+                .use { it.readText() }
+            val json = JSONArray(text)
+            buildList {
+                for (index in 0 until json.length()) {
+                    json.optJSONObject(index)?.toAthleteProfile()?.let { add(it) }
+                }
+            }
+        } catch (e: Exception) {
+            athleteStatus.value = "Could not load athletes: ${e.message}"
+            emptyList()
+        }
+    }
+
+    private fun saveAthletesToJson(profiles: List<AthleteProfile>): Boolean {
+        return try {
+            val json = JSONArray()
+            profiles.forEach { json.put(it.toStorageJson()) }
+            openFileOutput(ATHLETES_FILE_NAME, MODE_PRIVATE)
+                .bufferedWriter()
+                .use { it.write(json.toString(2)) }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun JSONObject.toAthleteProfile(): AthleteProfile? {
+        val profileId = optDisplayString("profile_id", "profileId")
+        val name = optDisplayString("name")
+        val email = optDisplayString("email")
+        val age = optInt("age", -1)
+        val weight = optDoubleValue("weight", "weight_kg")
+        val height = optDoubleValue("height", "height_cm")
+
+        if (
+            profileId == "--" ||
+            name == "--" ||
+            email == "--" ||
+            age <= 0 ||
+            weight == null ||
+            height == null
+        ) {
+            return null
         }
 
-        when {
-            brokerValue.isBlank() -> {
-                hrTestStatus.value = "Broker is required"
-                return
-            }
-            portValue == null -> {
-                hrTestStatus.value = "Invalid port"
-                return
-            }
-            deviceValue.isBlank() -> {
-                hrTestStatus.value = "Device ID is required"
-                return
-            }
-            heartRateTopicValue.isBlank() -> {
-                hrTestStatus.value = "Heart-rate topic is required"
-                return
-            }
-            sessionValue.isBlank() -> {
-                hrTestStatus.value = "Session ID is required for HR test"
-                return
-            }
-            bpmValue == null || bpmValue <= 0 -> {
-                hrTestStatus.value = "Heart rate must be a valid positive integer"
-                return
+        return AthleteProfile(
+            profileId = profileId,
+            name = name,
+            age = age,
+            weight = weight,
+            height = height,
+            email = email,
+            fitnessLevel = optDisplayString("fitness_level", "fitnessLevel")
+                .takeUnless { it == "--" }
+                .orEmpty()
+        )
+    }
+
+    private fun AthleteProfile.toStorageJson(): JSONObject {
+        return JSONObject()
+            .put("profile_id", profileId)
+            .put("name", name)
+            .put("age", age)
+            .put("weight", weight)
+            .put("height", height)
+            .put("email", email)
+            .put("fitness_level", fitnessLevel)
+    }
+
+    private fun AthleteProfile.toPayloadJson(): JSONObject {
+        return JSONObject()
+            .put("name", name)
+            .put("age", age)
+            .put("weight", weight)
+            .put("height", height)
+            .put("email", email)
+            .put("fitness_level", fitnessLevel)
+    }
+
+    private fun JSONObject.optDoubleValue(vararg keys: String): Double? {
+        keys.forEach { key ->
+            if (has(key) && !isNull(key)) {
+                return opt(key)?.toString()?.trim()?.toDoubleOrNull()
             }
         }
 
-        mainScope.launch {
-            hrTestStatus.value = "Publishing test HR $bpmValue..."
-            hrTestStatus.value = publishHeartRate(
-                broker = brokerValue,
-                port = portValue,
-                topic = heartRateTopicValue,
-                deviceId = deviceValue,
-                sessionId = sessionValue,
-                heartRateBpm = bpmValue,
-                source = "android_phone_manual"
-            )
-        }
+        return null
     }
 
     private fun publishCurrentHeartRate(source: String) {
@@ -389,27 +610,30 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
         val portValue = port.value.trim().toIntOrNull()
         val deviceValue = deviceId.value.trim()
         val heartRateTopicValue = heartRateTopic.value.trim()
-        val sessionValue = sessionId.value.trim()
-        val bpmValue = manualHeartRate.value.trim().toIntOrNull() ?: 0
+        val sessionValue = activeSessionId.value.ifBlank { sessionId.value.trim() }
+        val bpmValue = latestHeartRateBpm.value.trim().toIntOrNull() ?: 0
 
         if (portValue == null) {
-            hrTestStatus.value = "Invalid port"
+            heartRateStatus.value = "Invalid port"
             return
         }
 
         if (sessionValue.isBlank() || sessionValue == "Waiting for session...") {
-            hrTestStatus.value = "No synced session yet"
+            heartRateStatus.value = "No synced session yet"
             return
         }
 
-        if (sessionStatus.value != "Active session synced") {
-            hrTestStatus.value = "No active session. Current status: ${sessionStatus.value}"
+        if (
+            activeAthlete.value == null &&
+            classifyWorkoutState(sessionStatus.value) != WorkoutDisplayState.Active
+        ) {
+            heartRateStatus.value = "No active session. Current status: ${sessionStatus.value}"
             return
         }
 
         mainScope.launch {
-            hrTestStatus.value = "Publishing BPM $bpmValue to $sessionValue..."
-            hrTestStatus.value = publishHeartRate(
+            heartRateStatus.value = "Publishing BPM $bpmValue to $sessionValue..."
+            heartRateStatus.value = publishHeartRate(
                 broker = brokerValue,
                 port = portValue,
                 topic = heartRateTopicValue,
@@ -549,7 +773,6 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
                 }
 
                 sessionId.value = incomingSessionId
-                manualHrSessionId.value = manualHrSessionId.value.ifBlank { incomingSessionId }
                 syncedWorkoutType.value = incomingWorkoutType
                 telemetry.value = telemetry.value.copy(
                     sessionId = incomingSessionId,
@@ -562,9 +785,12 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
                         sessionStatus.value = "Active session synced"
                         settingsStatus.value = "Synced $incomingSessionId ($incomingWorkoutType)"
                     }
-                    "stopped" -> {
+                    "stopped", "ended" -> {
                         sessionStatus.value = "Session stopped"
                         settingsStatus.value = "Session stopped: $incomingSessionId"
+                        activeAthlete.value = null
+                        activeWorkoutType.value = ""
+                        activeSessionId.value = ""
                     }
                     else -> {
                         sessionStatus.value = incomingStatus.ifBlank { "Session updated" }
@@ -657,7 +883,6 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
 
                 nextTelemetry.sessionId.takeUnless { it == "--" }?.let {
                     sessionId.value = it
-                    manualHrSessionId.value = manualHrSessionId.value.ifBlank { it }
                 }
 
                 nextTelemetry.workoutType.takeUnless { it == "--" }?.let {
@@ -666,6 +891,11 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
 
                 nextTelemetry.workoutStatus.takeUnless { it == "--" }?.let {
                     sessionStatus.value = it
+                    if (classifyWorkoutState(it) == WorkoutDisplayState.Stopped) {
+                        activeAthlete.value = null
+                        activeWorkoutType.value = ""
+                        activeSessionId.value = ""
+                    }
                 }
             } catch (e: Exception) {
                 telemetryStatus.value = "Telemetry parse error: ${e.message}"
@@ -694,39 +924,41 @@ class MainActivity : ComponentActivity(), MessageClient.OnMessageReceivedListene
             age = athleteAge.value,
             weightKg = athleteWeightKg.value,
             heightCm = athleteHeightCm.value,
-            email = athleteEmail.value,
-            workoutType = selectedWorkoutType.value
+            email = athleteEmail.value
         )
     }
 
     private fun buildStartWorkoutPayload(
         deviceId: String,
-        workoutType: String,
-        name: String,
-        age: Int,
-        weightKg: Double,
-        heightCm: Double,
-        email: String
+        sessionId: String,
+        athlete: AthleteProfile,
+        workoutType: String
     ): JSONObject {
-        val athlete = JSONObject()
-            .put("name", name)
-            .put("age", age)
-            .put("weight_kg", weightKg)
-            .put("height_cm", heightCm)
-            .put("email", email)
-
         return JSONObject()
             .put("command", "start_workout")
+            .put("status", "started")
             .put("device_id", deviceId)
+            .put("session_id", sessionId)
+            .put("profile_id", athlete.profileId)
+            .put("athlete", athlete.toPayloadJson())
             .put("workout_type", workoutType)
-            .put("mode", "real")
-            .put("athlete", athlete)
+            .put("timestamp", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
     }
 
-    private fun buildStopWorkoutPayload(deviceId: String): JSONObject {
+    private fun buildEndWorkoutPayload(
+        deviceId: String,
+        sessionId: String,
+        athlete: AthleteProfile,
+        workoutType: String
+    ): JSONObject {
         return JSONObject()
-            .put("command", "stop_workout")
+            .put("command", "end_workout")
+            .put("status", "ended")
             .put("device_id", deviceId)
+            .put("session_id", sessionId)
+            .put("profile_id", athlete.profileId)
+            .put("workout_type", workoutType)
+            .put("timestamp", LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
     }
 
     private fun publishMqttJson(
@@ -809,16 +1041,20 @@ private fun BikeTrainerApp(
     onAthleteHeightCmChange: (String) -> Unit,
     athleteEmail: String,
     onAthleteEmailChange: (String) -> Unit,
+    athleteFitnessLevel: String,
+    onAthleteFitnessLevelChange: (String) -> Unit,
+    athletes: List<AthleteProfile>,
+    onDeleteAthleteClick: (String) -> Unit,
+    selectedAthleteProfileId: String,
+    onSelectedAthleteChange: (String) -> Unit,
+    selectedAthlete: AthleteProfile?,
+    activeAthlete: AthleteProfile?,
+    activeWorkoutType: String,
+    activeSessionId: String,
     selectedWorkoutType: String,
     onWorkoutTypeChange: (String) -> Unit,
     athleteStatus: String,
     onSaveAthleteClick: () -> Unit,
-    manualHeartRate: String,
-    onManualHeartRateChange: (String) -> Unit,
-    manualHrSessionId: String,
-    onManualHrSessionIdChange: (String) -> Unit,
-    hrTestStatus: String,
-    onPublishTestHrClick: () -> Unit,
     telemetry: TelemetryValues,
     telemetryStatus: String,
     dashboardStatus: String,
@@ -859,7 +1095,7 @@ private fun BikeTrainerApp(
                 modifier = Modifier.padding(innerPadding)
             )
 
-            AppPage.Athlete -> AthleteScreen(
+            AppPage.Athletes -> AthleteScreen(
                 athleteName = athleteName,
                 onAthleteNameChange = onAthleteNameChange,
                 athleteAge = athleteAge,
@@ -870,22 +1106,27 @@ private fun BikeTrainerApp(
                 onAthleteHeightCmChange = onAthleteHeightCmChange,
                 athleteEmail = athleteEmail,
                 onAthleteEmailChange = onAthleteEmailChange,
-                selectedWorkoutType = selectedWorkoutType,
-                onWorkoutTypeChange = onWorkoutTypeChange,
+                athleteFitnessLevel = athleteFitnessLevel,
+                onAthleteFitnessLevelChange = onAthleteFitnessLevelChange,
+                athletes = athletes,
                 athleteStatus = athleteStatus,
                 onSaveAthleteClick = onSaveAthleteClick,
+                onDeleteAthleteClick = onDeleteAthleteClick,
                 modifier = Modifier.padding(innerPadding)
             )
 
-            AppPage.HrTest -> HrTestScreen(
-                manualHeartRate = manualHeartRate,
-                onManualHeartRateChange = onManualHeartRateChange,
-                manualHrSessionId = manualHrSessionId,
-                onManualHrSessionIdChange = onManualHrSessionIdChange,
-                syncedSessionId = sessionId,
-                heartRateTopic = heartRateTopic,
-                hrTestStatus = hrTestStatus,
-                onPublishTestHrClick = onPublishTestHrClick,
+            AppPage.Workout -> WorkoutScreen(
+                athletes = athletes,
+                selectedAthleteProfileId = selectedAthleteProfileId,
+                onSelectedAthleteChange = onSelectedAthleteChange,
+                selectedWorkoutType = selectedWorkoutType,
+                onWorkoutTypeChange = onWorkoutTypeChange,
+                activeAthlete = activeAthlete,
+                activeWorkoutType = activeWorkoutType,
+                activeSessionId = activeSessionId,
+                dashboardStatus = dashboardStatus,
+                onStartWorkoutClick = onStartWorkoutClick,
+                onStopWorkoutClick = onStopWorkoutClick,
                 modifier = Modifier.padding(innerPadding)
             )
 
@@ -898,11 +1139,9 @@ private fun BikeTrainerApp(
                 sessionStatus = sessionStatus,
                 syncedWorkoutType = syncedWorkoutType,
                 selectedWorkoutType = selectedWorkoutType,
-                athleteName = athleteName,
-                athleteAge = athleteAge,
-                athleteWeightKg = athleteWeightKg,
-                athleteHeightCm = athleteHeightCm,
-                athleteEmail = athleteEmail,
+                selectedAthlete = selectedAthlete,
+                activeAthlete = activeAthlete,
+                activeWorkoutType = activeWorkoutType,
                 telemetry = telemetry,
                 telemetryStatus = telemetryStatus,
                 dashboardStatus = dashboardStatus,
@@ -1057,15 +1296,17 @@ private fun AthleteScreen(
     onAthleteHeightCmChange: (String) -> Unit,
     athleteEmail: String,
     onAthleteEmailChange: (String) -> Unit,
-    selectedWorkoutType: String,
-    onWorkoutTypeChange: (String) -> Unit,
+    athleteFitnessLevel: String,
+    onAthleteFitnessLevelChange: (String) -> Unit,
+    athletes: List<AthleteProfile>,
     athleteStatus: String,
     onSaveAthleteClick: () -> Unit,
+    onDeleteAthleteClick: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     ScreenColumn(modifier = modifier) {
         Text(
-            text = "Athlete",
+            text = "Athletes",
             style = MaterialTheme.typography.headlineSmall
         )
 
@@ -1103,14 +1344,10 @@ private fun AthleteScreen(
             keyboardType = KeyboardType.Email
         )
 
-        Text(
-            text = "Workout type",
-            style = MaterialTheme.typography.titleMedium
-        )
-
-        WorkoutTypeSelector(
-            selectedWorkoutType = selectedWorkoutType,
-            onWorkoutTypeChange = onWorkoutTypeChange
+        TextFieldRow(
+            value = athleteFitnessLevel,
+            onValueChange = onAthleteFitnessLevelChange,
+            label = "Fitness level (optional)"
         )
 
         Button(
@@ -1124,61 +1361,218 @@ private fun AthleteScreen(
             text = "Athlete status: $athleteStatus",
             style = MaterialTheme.typography.bodyLarge
         )
+
+        Text(
+            text = "Saved athletes",
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        if (athletes.isEmpty()) {
+            Text(
+                text = "No athletes saved",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            athletes.forEach { athlete ->
+                SavedAthleteCard(
+                    athlete = athlete,
+                    onDeleteClick = { onDeleteAthleteClick(athlete.profileId) }
+                )
+            }
+        }
     }
 }
 
 @Composable
-private fun HrTestScreen(
-    manualHeartRate: String,
-    onManualHeartRateChange: (String) -> Unit,
-    manualHrSessionId: String,
-    onManualHrSessionIdChange: (String) -> Unit,
-    syncedSessionId: String,
-    heartRateTopic: String,
-    hrTestStatus: String,
-    onPublishTestHrClick: () -> Unit,
+private fun SavedAthleteCard(
+    athlete: AthleteProfile,
+    onDeleteClick: () -> Unit
+) {
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = athlete.name,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            InfoLine("Email", athlete.email)
+            InfoLine("Age", athlete.age.toString())
+            if (athlete.fitnessLevel.isNotBlank()) {
+                InfoLine("Fitness level", athlete.fitnessLevel)
+            }
+
+            OutlinedButton(
+                onClick = onDeleteClick,
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error
+                ),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Delete")
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkoutScreen(
+    athletes: List<AthleteProfile>,
+    selectedAthleteProfileId: String,
+    onSelectedAthleteChange: (String) -> Unit,
+    selectedWorkoutType: String,
+    onWorkoutTypeChange: (String) -> Unit,
+    activeAthlete: AthleteProfile?,
+    activeWorkoutType: String,
+    activeSessionId: String,
+    dashboardStatus: String,
+    onStartWorkoutClick: () -> Unit,
+    onStopWorkoutClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val selectedAthlete = athletes.firstOrNull { it.profileId == selectedAthleteProfileId }
+    val commandInFlight = dashboardStatus.startsWith("Sending", ignoreCase = true)
+    val hasValidWorkoutType = selectedWorkoutType in VALID_WORKOUT_TYPES
+    val workoutActive = activeAthlete != null
+    val startEnabled =
+        selectedAthlete != null && hasValidWorkoutType && !workoutActive && !commandInFlight
+    val endEnabled = workoutActive && !commandInFlight
+
     ScreenColumn(modifier = modifier) {
         Text(
-            text = "HR Test",
+            text = "Workout",
             style = MaterialTheme.typography.headlineSmall
         )
 
         Text(
-            text = "Heart-rate topic: $heartRateTopic",
-            style = MaterialTheme.typography.bodyMedium
+            text = "Select athlete",
+            style = MaterialTheme.typography.titleMedium
         )
 
-        Text(
-            text = "Synced session: $syncedSessionId",
-            style = MaterialTheme.typography.bodyMedium
-        )
-
-        TextFieldRow(
-            value = manualHeartRate,
-            onValueChange = onManualHeartRateChange,
-            label = "Manual heart rate BPM",
-            keyboardType = KeyboardType.Number
-        )
-
-        TextFieldRow(
-            value = manualHrSessionId,
-            onValueChange = onManualHrSessionIdChange,
-            label = "Session ID"
-        )
-
-        Button(
-            onClick = onPublishTestHrClick,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text("Publish Test HR")
+        if (athletes.isEmpty()) {
+            Text(
+                text = "No saved athletes yet",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            athletes.forEach { athlete ->
+                WorkoutAthleteCard(
+                    athlete = athlete,
+                    selected = athlete.profileId == selectedAthleteProfileId,
+                    onSelectClick = { onSelectedAthleteChange(athlete.profileId) }
+                )
+            }
         }
 
         Text(
-            text = "HR test status: $hrTestStatus",
+            text = "Workout type",
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        WorkoutTypeSelector(
+            selectedWorkoutType = selectedWorkoutType,
+            onWorkoutTypeChange = onWorkoutTypeChange
+        )
+
+        activeAthlete?.let { athlete ->
+            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Active workout",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    InfoLine("Athlete", athlete.name)
+                    InfoLine("Workout type", activeWorkoutType.displayText())
+                    InfoLine("Session ID", activeSessionId.displayText())
+                }
+            }
+        }
+
+        Button(
+            onClick = onStartWorkoutClick,
+            enabled = startEnabled,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp)
+        ) {
+            Icon(
+                imageVector = AppIcons.Play,
+                contentDescription = null
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Start Workout")
+        }
+
+        OutlinedButton(
+            onClick = onStopWorkoutClick,
+            enabled = endEnabled,
+            colors = ButtonDefaults.outlinedButtonColors(
+                contentColor = MaterialTheme.colorScheme.error
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp)
+        ) {
+            Icon(
+                imageVector = AppIcons.Stop,
+                contentDescription = null
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("End Workout")
+        }
+
+        Text(
+            text = "Workout status: $dashboardStatus",
             style = MaterialTheme.typography.bodyLarge
         )
+    }
+}
+
+@Composable
+private fun WorkoutAthleteCard(
+    athlete: AthleteProfile,
+    selected: Boolean,
+    onSelectClick: () -> Unit
+) {
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = athlete.name,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold
+            )
+            InfoLine("Email", athlete.email)
+            InfoLine("Age", athlete.age.toString())
+
+            if (selected) {
+                StatusBadge(
+                    label = "Selected",
+                    tone = DashboardTone(
+                        accent = MaterialTheme.colorScheme.primary,
+                        container = MaterialTheme.colorScheme.primaryContainer,
+                        onContainer = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                )
+            } else {
+                OutlinedButton(
+                    onClick = onSelectClick,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Select")
+                }
+            }
+        }
     }
 }
 
@@ -1192,11 +1586,9 @@ private fun DashboardScreen(
     sessionStatus: String,
     syncedWorkoutType: String,
     selectedWorkoutType: String,
-    athleteName: String,
-    athleteAge: String,
-    athleteWeightKg: String,
-    athleteHeightCm: String,
-    athleteEmail: String,
+    selectedAthlete: AthleteProfile?,
+    activeAthlete: AthleteProfile?,
+    activeWorkoutType: String,
     telemetry: TelemetryValues,
     telemetryStatus: String,
     dashboardStatus: String,
@@ -1207,23 +1599,22 @@ private fun DashboardScreen(
     val displaySessionId = telemetry.sessionId.valueOr(sessionId)
     val displayWorkoutStatus = telemetry.workoutStatus.valueOr(sessionStatus)
     val displayWorkoutType = telemetry.workoutType
+        .valueOr(activeWorkoutType)
         .valueOr(syncedWorkoutType)
         .valueOr(selectedWorkoutType)
     val displayMode = telemetry.mode.valueOr("real")
     val displayState = classifyWorkoutState(displayWorkoutStatus)
-    val athleteValidationError = validateAthleteInputValues(
-        name = athleteName,
-        age = athleteAge,
-        weightKg = athleteWeightKg,
-        heightCm = athleteHeightCm,
-        email = athleteEmail,
-        workoutType = selectedWorkoutType
-    )
+    val dashboardAthlete = activeAthlete ?: selectedAthlete
+    val athleteValidationError = when {
+        selectedAthlete == null -> "Select an athlete on the Workout page"
+        selectedWorkoutType !in VALID_WORKOUT_TYPES -> "Select a valid workout type"
+        else -> null
+    }
     val commandInFlight = dashboardStatus.startsWith("Sending", ignoreCase = true)
     val startCommandSent = dashboardStatus.equals("Start command sent", ignoreCase = true)
-    val isWorkoutActive = displayState == WorkoutDisplayState.Active
+    val isWorkoutActive = activeAthlete != null || displayState == WorkoutDisplayState.Active
     val startEnabled = athleteValidationError == null && !isWorkoutActive && !commandInFlight
-    val stopEnabled = !commandInFlight && (isWorkoutActive || startCommandSent)
+    val stopEnabled = activeAthlete != null && !commandInFlight && (isWorkoutActive || startCommandSent)
 
     ScreenColumn(modifier = modifier) {
         Text(
@@ -1252,7 +1643,7 @@ private fun DashboardScreen(
 
         HeartRateIntensityCard(
             heartRateBpm = telemetry.heartRateBpm,
-            athleteAge = athleteAge
+            athleteAge = dashboardAthlete?.age?.toString().orEmpty()
         )
 
         SafetyDistanceCard(
@@ -1542,7 +1933,7 @@ private fun HeartRateIntensityCard(
                 }
 
                 LinearProgressIndicator(
-                    progress = progress,
+                    progress = { progress },
                     color = tone.accent,
                     trackColor = tone.accent.copy(alpha = 0.14f),
                     modifier = Modifier
@@ -1972,22 +2363,22 @@ private fun validateAthleteInputValues(
     age: String,
     weightKg: String,
     heightCm: String,
-    email: String,
-    workoutType: String
+    email: String
 ): String? {
+    val ageValue = age.trim().toIntOrNull()
+    val weightValue = weightKg.trim().toDoubleOrNull()
+    val heightValue = heightCm.trim().toDoubleOrNull()
+
     return when {
         name.trim().isBlank() -> "Name cannot be empty"
-        age.trim().toIntOrNull() == null -> "Age must be a valid integer"
-        weightKg.trim().toDoubleOrNull() == null -> {
+        ageValue == null || ageValue <= 0 -> "Age must be a valid positive integer"
+        weightValue == null || weightValue <= 0.0 -> {
             "Weight must be a valid number"
         }
-        heightCm.trim().toDoubleOrNull() == null -> {
+        heightValue == null || heightValue <= 0.0 -> {
             "Height must be a valid number"
         }
         email.trim().isBlank() -> "Email cannot be empty"
-        workoutType.trim() !in VALID_WORKOUT_TYPES -> {
-            "Workout type must be speed, cadence, endurance, or vo2_max"
-        }
         else -> null
     }
 }
@@ -2040,42 +2431,26 @@ private fun WorkoutTypeSelector(
     selectedWorkoutType: String,
     onWorkoutTypeChange: (String) -> Unit
 ) {
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        WorkoutTypeButton(
-            label = "speed",
-            selected = selectedWorkoutType == "speed",
-            onClick = { onWorkoutTypeChange("speed") },
-            modifier = Modifier.weight(1f)
-        )
-        WorkoutTypeButton(
-            label = "cadence",
-            selected = selectedWorkoutType == "cadence",
-            onClick = { onWorkoutTypeChange("cadence") },
-            modifier = Modifier.weight(1f)
-        )
-    }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        WORKOUT_TYPE_OPTIONS.chunked(2).forEach { rowItems ->
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                rowItems.forEach { workoutType ->
+                    WorkoutTypeButton(
+                        label = workoutType,
+                        selected = selectedWorkoutType == workoutType,
+                        onClick = { onWorkoutTypeChange(workoutType) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
 
-    Spacer(modifier = Modifier.height(8.dp))
-
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.fillMaxWidth()
-    ) {
-        WorkoutTypeButton(
-            label = "endurance",
-            selected = selectedWorkoutType == "endurance",
-            onClick = { onWorkoutTypeChange("endurance") },
-            modifier = Modifier.weight(1f)
-        )
-        WorkoutTypeButton(
-            label = "vo2_max",
-            selected = selectedWorkoutType == "vo2_max",
-            onClick = { onWorkoutTypeChange("vo2_max") },
-            modifier = Modifier.weight(1f)
-        )
+                if (rowItems.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
     }
 }
 
@@ -2125,8 +2500,8 @@ private fun TelemetryRow(label: String, value: String) {
 private fun AppPage.icon(): ImageVector {
     return when (this) {
         AppPage.Settings -> AppIcons.Settings
-        AppPage.Athlete -> AppIcons.Person
-        AppPage.HrTest -> AppIcons.Heart
+        AppPage.Athletes -> AppIcons.Person
+        AppPage.Workout -> AppIcons.Activity
         AppPage.Dashboard -> AppIcons.Dashboard
     }
 }
