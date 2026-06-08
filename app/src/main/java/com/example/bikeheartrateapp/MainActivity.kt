@@ -4,10 +4,13 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
@@ -22,6 +25,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CardDefaults
@@ -1109,6 +1114,8 @@ private fun BikeTrainerApp(
                 athleteFitnessLevel = athleteFitnessLevel,
                 onAthleteFitnessLevelChange = onAthleteFitnessLevelChange,
                 athletes = athletes,
+                selectedAthleteProfileId = selectedAthleteProfileId,
+                onSelectedAthleteChange = onSelectedAthleteChange,
                 athleteStatus = athleteStatus,
                 onSaveAthleteClick = onSaveAthleteClick,
                 onDeleteAthleteClick = onDeleteAthleteClick,
@@ -1299,6 +1306,8 @@ private fun AthleteScreen(
     athleteFitnessLevel: String,
     onAthleteFitnessLevelChange: (String) -> Unit,
     athletes: List<AthleteProfile>,
+    selectedAthleteProfileId: String,
+    onSelectedAthleteChange: (String) -> Unit,
     athleteStatus: String,
     onSaveAthleteClick: () -> Unit,
     onDeleteAthleteClick: (String) -> Unit,
@@ -1374,46 +1383,12 @@ private fun AthleteScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         } else {
-            athletes.forEach { athlete ->
-                SavedAthleteCard(
-                    athlete = athlete,
-                    onDeleteClick = { onDeleteAthleteClick(athlete.profileId) }
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SavedAthleteCard(
-    athlete: AthleteProfile,
-    onDeleteClick: () -> Unit
-) {
-    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Text(
-                text = athlete.name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold
+            AthleteCarousel(
+                athletes = athletes,
+                selectedProfileId = selectedAthleteProfileId,
+                onSelectAthlete = { onSelectedAthleteChange(it.profileId) },
+                onDeleteAthlete = { onDeleteAthleteClick(it.profileId) }
             )
-            InfoLine("Email", athlete.email)
-            InfoLine("Age", athlete.age.toString())
-            if (athlete.fitnessLevel.isNotBlank()) {
-                InfoLine("Fitness level", athlete.fitnessLevel)
-            }
-
-            OutlinedButton(
-                onClick = onDeleteClick,
-                colors = ButtonDefaults.outlinedButtonColors(
-                    contentColor = MaterialTheme.colorScheme.error
-                ),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Delete")
-            }
         }
     }
 }
@@ -1459,13 +1434,11 @@ private fun WorkoutScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         } else {
-            athletes.forEach { athlete ->
-                WorkoutAthleteCard(
-                    athlete = athlete,
-                    selected = athlete.profileId == selectedAthleteProfileId,
-                    onSelectClick = { onSelectedAthleteChange(athlete.profileId) }
-                )
-            }
+            AthleteCarousel(
+                athletes = athletes,
+                selectedProfileId = selectedAthleteProfileId,
+                onSelectAthlete = { onSelectedAthleteChange(it.profileId) }
+            )
         }
 
         Text(
@@ -1537,12 +1510,62 @@ private fun WorkoutScreen(
 }
 
 @Composable
-private fun WorkoutAthleteCard(
+private fun AthleteCarousel(
+    athletes: List<AthleteProfile>,
+    selectedProfileId: String?,
+    onSelectAthlete: (AthleteProfile) -> Unit,
+    onDeleteAthlete: ((AthleteProfile) -> Unit)? = null
+) {
+    LazyRow(
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = PaddingValues(horizontal = 2.dp, vertical = 4.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        items(
+            items = athletes,
+            key = { it.profileId }
+        ) { athlete ->
+            AthleteCarouselCard(
+                athlete = athlete,
+                selected = athlete.profileId == selectedProfileId,
+                onSelectClick = { onSelectAthlete(athlete) },
+                onDeleteClick = onDeleteAthlete?.let { delete -> { delete(athlete) } }
+            )
+        }
+    }
+}
+
+@Composable
+private fun AthleteCarouselCard(
     athlete: AthleteProfile,
     selected: Boolean,
-    onSelectClick: () -> Unit
+    onSelectClick: () -> Unit,
+    onDeleteClick: (() -> Unit)?
 ) {
-    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+    val cardWidth = if (selected) 272.dp else 248.dp
+    val cardColor = if (selected) {
+        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+    } else {
+        MaterialTheme.colorScheme.surface
+    }
+    val border = if (selected) {
+        BorderStroke(2.dp, MaterialTheme.colorScheme.primary)
+    } else {
+        BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.25f))
+    }
+
+    Surface(
+        shape = RoundedCornerShape(16.dp),
+        color = cardColor,
+        contentColor = MaterialTheme.colorScheme.onSurface,
+        tonalElevation = if (selected) 4.dp else 1.dp,
+        shadowElevation = if (selected) 6.dp else 2.dp,
+        border = border,
+        modifier = Modifier
+            .width(cardWidth)
+            .defaultMinSize(minHeight = 190.dp)
+            .clickable(onClick = onSelectClick)
+    ) {
         Column(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -1554,6 +1577,9 @@ private fun WorkoutAthleteCard(
             )
             InfoLine("Email", athlete.email)
             InfoLine("Age", athlete.age.toString())
+            if (athlete.fitnessLevel.isNotBlank()) {
+                InfoLine("Fitness level", athlete.fitnessLevel)
+            }
 
             if (selected) {
                 StatusBadge(
@@ -1564,12 +1590,17 @@ private fun WorkoutAthleteCard(
                         onContainer = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                 )
-            } else {
+            }
+
+            if (onDeleteClick != null) {
                 OutlinedButton(
-                    onClick = onSelectClick,
+                    onClick = onDeleteClick,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    ),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Select")
+                    Text("Delete")
                 }
             }
         }
